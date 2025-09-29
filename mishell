@@ -1,0 +1,267 @@
+// mishell.c - Shell con miprof y soporte de pipes
+// Autor: Benja
+// Funcionalidades: prompt, lectura de comandos, exec, pipes y miprof
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <fcntl.h>
+
+// ================== UTILS ==================
+char *trim(char *s) {
+    if (!s) return s;
+    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    if (*s == 0) return s;
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' || *end == '\n')) {
+        *end = '\0';
+        end--;
+    }
+    return s;
+}
+
+char **parse_args(const char *cmd) {
+    if (!cmd) return NULL;
+    char *s = strdup(cmd);
+    int cap = 8;
+    char **argv = malloc(sizeof(char*) * cap);
+    int argc = 0;
+
+    char *saveptr = NULL;
+    char *token = strtok_r(s, " \t", &saveptr);
+    while (token) {
+        if (argc >= cap - 1) {
+            cap *= 2;
+            argv = realloc(argv, sizeof(char*) * cap);
+        }
+        argv[argc++] = strdup(token);
+        token = strtok_r(NULL, " \t", &saveptr);
+    }
+    argv[argc] = NULL;
+    free(s);
+    return argv;
+}
+
+void free_args(char **argv) {
+    if (!argv) return;
+    for (int i = 0; argv[i]; ++i) free(argv[i]);
+    free(argv);
+}
+
+// ================== MIPROF ==================
+void run_miprof(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Uso: miprof [ejec|ejecsave archivo|maxtiempo N] comando args\n");
+        return;
+    }
+
+    int save_to_file = 0;
+    char *filename = NULL;
+    int maxtime = -1;
+
+    char **cmd_args = NULL;
+
+    if (strcmp(argv[1], "ejec") == 0) {
+        cmd_args = &argv[2];
+    } else if (strcmp(argv[1], "ejecsave") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Uso: miprof ejecsave archivo comando args\n");
+            return;
+        }
+        save_to_file = 1;
+        filename = argv[2];
+        cmd_args = &argv[3];
+    } else if (strcmp(argv[1], "maxtiempo") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Uso: miprof maxtiempo N comando args\n");
+            return;
+        }
+        maxtime = atoi(argv[2]);
+        cmd_args = &argv[3];
+    } else {
+        fprintf(stderr, "Modo no válido: %s\n", argv[1]);
+        return;
+    }
+
+    struct timespec start, end;
+    struct rusage usage;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        // Child
+        if (maxtime > 0) {
+            alarm(maxtime);
+        }
+        execvp(cmd_args[0], cmd_args);
+        perror("execvp");
+        _exit(127);
+    } else {
+        // Parent
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+            return;
+        }
+        getrusage(RUSAGE_CHILDREN, &usage);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        double real_time = (end.tv_sec - start.tv_sec) +
+                           (end.tv_nsec - start.tv_nsec) / 1e9;
+        double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6;
+        double sys_time  = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+        long max_rss = usage.ru_maxrss; // KB en Linux
+
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer),
+            "Comando: %s\nTiempo real: %.6f s\nTiempo usuario: %.6f s\nTiempo sistema: %.6f s\nMemoria máxima (RSS): %ld KB\n\n",
+            cmd_args[0], real_time, user_time, sys_time, max_rss);
+
+        printf("%s", buffer);
+
+        if (save_to_file && filename) {
+            int fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd == -1) {
+                perror("open");
+                return;
+            }
+            write(fd, buffer, strlen(buffer));
+            close(fd);
+        }
+    }
+}
+
+// ================== PIPES ==================
+void execute_pipeline(char *line) {
+    char *cmds[32];
+    int n = 0;
+
+    char *saveptr = NULL;
+    char *token = strtok_r(line, "|", &saveptr);
+    while (token && n < 32) {
+        cmds[n++] = trim(token);
+        token = strtok_r(NULL, "|", &saveptr);
+    }
+
+    int pipes[2*(n-1)];
+    for (int i = 0; i < n-1; i++) {
+        if (pipe(pipes + i*2) < 0) {
+            perror("pipe");
+            exit(1);
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (i > 0) {
+                dup2(pipes[(i-1)*2], STDIN_FILENO);
+            }
+            if (i < n-1) {
+                dup2(pipes[i*2 + 1], STDOUT_FILENO);
+            }
+
+            for (int j = 0; j < 2*(n-1); j++) close(pipes[j]);
+
+            char **argv = parse_args(cmds[i]);
+            execvp(argv[0], argv);
+            fprintf(stderr, "%s: comando no encontrado\n", argv[0]);
+            _exit(127);
+        }
+    }
+
+    for (int j = 0; j < 2*(n-1); j++) close(pipes[j]);
+
+    for (int i = 0; i < n; i++) {
+        int status;
+        wait(&status);
+    }
+}
+
+// ================== SHELL ==================
+void execute_command(char *line) {
+    // Detectar si hay pipes
+    if (strchr(line, '|')) {
+        execute_pipeline(line);
+        return;
+    }
+
+    char **argv = parse_args(line);
+    if (!argv || !argv[0]) {
+        free_args(argv);
+        return;
+    }
+
+    if (strcmp(argv[0], "exit") == 0) {
+        free_args(argv);
+        exit(0);
+    }
+
+    if (strcmp(argv[0], "miprof") == 0) {
+        int argc = 0;
+        while (argv[argc]) argc++;
+        run_miprof(argc, argv);
+        free_args(argv);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        execvp(argv[0], argv);
+        fprintf(stderr, "%s: comando no encontrado\n", argv[0]);
+        _exit(127);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+    } else {
+        perror("fork");
+    }
+    free_args(argv);
+}
+
+int main() {
+    signal(SIGINT, SIG_IGN);
+
+    char *line = NULL;
+    size_t len = 0;
+
+    while (1) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd))) {
+            printf("mishell:%s$ ", cwd);
+        } else {
+            printf("mishell$ ");
+        }
+        fflush(stdout);
+
+        if (getline(&line, &len, stdin) == -1) {
+            printf("\n");
+            break;
+        }
+
+        if (line[0] == '\n') continue;
+
+        line[strcspn(line, "\n")] = 0;
+        execute_command(line);
+    }
+
+    free(line);
+    return 0;
+}
